@@ -29,16 +29,19 @@ set -e
 SUBDIRECTORY_OK=Yes
 OPTIONS_KEEPDASHDASH=""
 OPTIONS_SPEC="\
-git publish [options] [<remote>]
-git publish [options] -d
+git publish [options] [<branch> [<remote>]]
+git publish [options] -r <newName> [<branch> [<remote>]]
+git publish [options] -d [<branch>]
 --
 v,verbose   print each command as it is run
 n,dry-run   don't run any commands, just print them
 f,force     don't do any checks on whether <local_branch> is tracking a branch already
-b,branch=   the local branch whose tracking information we will change and that we will publish
+r,rename=    rename the local <branch> and the remote branch to <newName>
 d,delete    delete tracking configuration for <local_branch>
 t,tracking-only only update tracking info - don't publish or delete any remote branches
-version     print version info in 'git publish version \$version' format"
+version     print version info in 'git publish version \$version' format
+
+NOTE: See help for full details on all options."
 
 . "$(git --exec-path)/git-sh-setup"
 
@@ -64,9 +67,12 @@ main() {
     dryrun=""
     force=""
     verbose=""
+    rename=""
+    newBranch=""
     delete=""
     branch=""
     track=""
+    currentBranch="$(git symbolic-ref HEAD | sed -e 's|^refs/heads/||')"
     while test $# -ne 0 ; do
         case "$1" in
         -n|--dry-run)
@@ -79,12 +85,13 @@ main() {
         -v|--verbose)
             verbose="true"
             ;;
+        -r|--rename)
+            rename="true"
+            newBranch="$2"
+            shift
+            ;;
         -d|--delete)
             delete="true"
-            ;;
-        -b|--branch)
-            branch="$2"
-            shift
             ;;
         -t|--tracking-only)
             track="true"
@@ -103,19 +110,70 @@ main() {
 
     remote="origin"
     if test $# -gt 0 ; then
-        remote="$1"
+        branch="$1"
+    else
+        assert_HEAD
+        branch=$currentBranch
     fi
     if test $# -gt 1 ; then
+        remote="$2"
+    fi
+    if test $# -gt 2 ; then
         usage >&2
         exit 1
     fi
-    if test -z "$branch" ; then
-        assert_HEAD
-        branch="$(git symbolic-ref "$branch")"
-        branch="$(echo "$branch" | sed -e 's|^refs/heads/||')"
-    fi
+    
+    if test -n "$rename" ; then
+        if test -z "$force" ; then
+            local_ref="$(git show-ref "heads/${branch}" || e=$?)"
+            if test -z "$local_ref" ; then
+                die "ERROR: No local branch ${branch} exists!"
+            fi
+            remote_ref="$(git show-ref "remotes/${remote}/${newBranch}" || e=$?)"
+            if test -n "$remote_ref" ; then
+                die "ERROR: A remote branch ${newBranch} on ${remote} already exists!"
+            fi
+	fi
+	# If not set to only updating tracking info...
+        if test -z "$track" ; then
+	    # Publish existing to the new name
+	    doit git push "${remote}" "${branch}:refs/heads/${newBranch}"
+	    # Now fetch the remote to get the tracking branch locally
+            doit git fetch "${remote}"
+	    # Create new local branch that tracks the new remote branch
+	    doit git branch --track "${newBranch}" "${remote}/${newBranch}"
+	    # If currently on the branch in question...
+	    if [ "${currentBranch}" == "${branch}" ]; then
+	        # Then switch to the newly created branch
+	        doit git checkout ${newBranch}
+            fi
 
-    if test -n "$delete" ; then
+	    # Check to see if the branch in question was previously tracking a remote branch
+	    trackingBranch=$(git for-each-ref --format='%(upstream)' refs/heads/${branch} | sed "s|refs/remotes/||")
+	    # If it was...
+	    if test -n "${trackingBranch}" ; then
+		# Grab the old remote
+	        oldRemote=$(echo $trackingBranch | sed 's|\([^/]*\)/.*|\1|')
+		# Grab the old tracking branch name
+		oldBranch=$(echo $trackingBranch | sed 's|[^/]*/\(.*\)|\1|')
+		# Then delete the old remote branch
+		doit git push "${oldRemote}" ":refs/heads/${oldBranch}"
+		# Now fetch the remote to get everything up to date
+		doit git fetch "${oldRemote}"
+		# Then, prune the remote to get rid of old tracking branches
+		doit git remote prune "${oldRemote}"
+	    fi
+
+	    # Finally, delete the old local branch
+            doit git branch -d ${branch}
+	# If set to only update tracking info...
+	else
+	    # Set the proper remote
+            doit git config "branch.${branch}.remote" "${remote}"
+	    # Set the tracking branch to the one specified
+	    doit git config "branch.${branch}.merge" "refs/heads/${newBranch}"
+	fi
+    elif test -n "$delete" ; then
         if test -z "$track" ; then
             doit git push "$remote" ":refs/heads/${branch}"
         fi
